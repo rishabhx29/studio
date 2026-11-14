@@ -256,6 +256,7 @@ export default function HeroWorld() {
       scene = createHeroScene(canvas, {
         reducedMotion: reduced,
         onBeat: () => operaSound.beat(),
+        onHover: (strength) => operaSound.setHover(strength),
       });
       sceneRef.current = scene;
 
@@ -346,6 +347,9 @@ export default function HeroWorld() {
           className="absolute inset-0 h-full w-full"
           aria-hidden="true"
         />
+
+        {/* lens vignette — photographic edge falloff over the world, under the type */}
+        <div aria-hidden="true" className="hero-vignette pointer-events-none absolute inset-0 z-[5]" />
 
         {/* white-violet implosion flash on scene change */}
         <div

@@ -610,7 +610,7 @@ void main() {
 /* ---------- scene assembly ---------- */
 export function createHeroScene(
   canvas: HTMLCanvasElement,
-  opts: { reducedMotion?: boolean; onBeat?: () => void } = {},
+  opts: { reducedMotion?: boolean; onBeat?: () => void; onHover?: (strength: number) => void } = {},
 ): HeroSceneHandle {
   const renderer = new THREE.WebGLRenderer({
     canvas,
@@ -696,6 +696,14 @@ export function createHeroScene(
         vec3 nebB = mix(vec3(0.055, 0.130, 0.300), vec3(0.160, 0.310, 0.520), n2);
         col += mix(nebV, nebB, uReveal) * neb * 0.70;
 
+        // zodiacal dust: a tilted great-circle band of clumped haze and
+        // unresolved micro-stars, so the empty sky has structure to read
+        float zd = abs(dot(d, normalize(vec3(0.85, 0.50, 0.15))));
+        float zband = exp(-pow(zd / 0.20, 2.0));
+        float zclump = 0.45 + 0.55 * smoothstep(0.35, 0.85, n2);
+        col += mix(vec3(0.085, 0.065, 0.150), vec3(0.060, 0.095, 0.170), uReveal) * zband * zclump * 0.70;
+        col += vec3(0.75, 0.72, 0.95) * zband * smoothstep(0.93, 1.0, hash(d * 890.0)) * 0.18;
+
         // analytic planet halo: angular distance above the limb (exact for a
         // sphere, independent of orbit position)
         vec3 oc = cameraPosition - uPlanetCenter;
@@ -721,6 +729,17 @@ export function createHeroScene(
         float aurora = exp(-pow(band / 0.010, 2.0));
         float shimmer = 0.45 + 0.55 * sin(azim * 5.0 - uTime * 0.26 + sin(azim * 2.0 + uTime * 0.11) * 2.0);
         col += mix(vec3(0.30, 0.33, 0.74), vec3(0.36, 0.68, 1.00), uReveal) * aurora * shimmer * 0.20;
+
+        // aurora curtains: rayed drapery rising off the airglow line, patchy
+        // around the limb so some azimuths breathe while others stay quiet
+        float rays = vnoise(vec3(azim * 16.0 + uTime * 0.02, above * 2.5 - uTime * 0.06, 3.7)) * 0.60
+                   + vnoise(vec3(azim * 38.0 - uTime * 0.035, above * 5.0, 9.2)) * 0.40;
+        float curtain = smoothstep(0.004, 0.020, above) * (1.0 - smoothstep(0.045, 0.160, above));
+        curtain *= smoothstep(0.34, 0.62, vnoise(vec3(azim * 1.7 + uTime * 0.008, 0.0, 5.1)));
+        curtain *= pow(max(rays, 0.0), 1.5);
+        vec3 aurV = mix(vec3(0.22, 0.16, 0.55), vec3(0.30, 0.55, 0.95), smoothstep(0.02, 0.10, above));
+        vec3 aurB = mix(vec3(0.18, 0.38, 0.75), vec3(0.35, 0.70, 1.00), smoothstep(0.02, 0.10, above));
+        col += mix(aurV, aurB, uReveal) * curtain * 0.65;
         gl_FragColor = vec4(col, 1.0);
       }`,
   });
@@ -734,11 +753,13 @@ export function createHeroScene(
   const makeStarLayer = (opts: {
     count: number; radius: number; seed: number;
     sizeMin: number; sizeMax: number; alpha: number; twinkle: number;
+    spikes?: boolean; sizePow?: number;
   }) => {
     const geo = new THREE.BufferGeometry();
     const sp = new Float32Array(opts.count * 3);
     const ss = new Float32Array(opts.count);
     const sph = new Float32Array(opts.count);
+    const st = new Float32Array(opts.count);
     const sr = mulberry32(opts.seed);
     for (let i = 0; i < opts.count; i++) {
       const y = 0.02 + Math.pow(sr(), 0.55) * 0.98;
@@ -747,39 +768,57 @@ export function createHeroScene(
       sp[i * 3] = Math.cos(a) * r * opts.radius;
       sp[i * 3 + 1] = y * opts.radius;
       sp[i * 3 + 2] = Math.sin(a) * r * opts.radius;
-      ss[i] = opts.sizeMin + Math.pow(sr(), 3) * (opts.sizeMax - opts.sizeMin);
+      ss[i] = opts.sizeMin + Math.pow(sr(), opts.sizePow ?? 3) * (opts.sizeMax - opts.sizeMin);
       sph[i] = sr();
+      st[i] = sr();
     }
     geo.setAttribute("position", new THREE.BufferAttribute(sp, 3));
     geo.setAttribute("aSize", new THREE.BufferAttribute(ss, 1));
     geo.setAttribute("aPhase", new THREE.BufferAttribute(sph, 1));
+    geo.setAttribute("aTemp", new THREE.BufferAttribute(st, 1));
     const uniforms = {
       uTime: { value: 0 },
       pixelRatio: { value: dpr },
       uAlpha: { value: opts.alpha },
       uTwinkle: { value: opts.twinkle },
+      uSpikes: { value: opts.spikes ? 1 : 0 },
     };
     const mat = new THREE.ShaderMaterial({
       uniforms,
       transparent: true,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
-      vertexShader: `attribute float aSize; attribute float aPhase;
+      vertexShader: `attribute float aSize; attribute float aPhase; attribute float aTemp;
         uniform float uTime; uniform float pixelRatio;
-        uniform float uAlpha; uniform float uTwinkle; varying float vA;
+        uniform float uAlpha; uniform float uTwinkle; varying float vA; varying float vTemp;
         void main(){
           float tw = 0.55 + 0.45 * sin(uTime * uTwinkle * (0.5 + aPhase) + aPhase * 6.28318);
           vA = (0.25 + tw * 0.65) * uAlpha;
+          vTemp = aTemp;
           vec4 mv = modelViewMatrix * vec4(position, 1.0);
           gl_Position = projectionMatrix * mv;
           gl_PointSize = aSize * pixelRatio * (0.85 + 0.3 * tw);
         }`,
-      fragmentShader: `precision highp float; varying float vA;
+      fragmentShader: `precision highp float; varying float vA; varying float vTemp;
+        uniform float uSpikes;
         void main(){
           vec2 uv = gl_PointCoord - 0.5; float d = length(uv);
           if (d > 0.5) discard;
           float a = smoothstep(0.5, 0.05, d);
-          gl_FragColor = vec4(mix(vec3(0.72, 0.64, 1.0), vec3(1.0), a), a * vA);
+          vec3 col = mix(vec3(0.72, 0.64, 1.0), vec3(1.0), a);
+          float alpha = a * vA;
+          if (uSpikes > 0.5) {
+            // bright anchor star: hot core, four-point diffraction cross,
+            // temperature tint from blue-white to a rare warm giant
+            vec3 tint = mix(vec3(0.66, 0.74, 1.0), vec3(1.0, 0.90, 0.82), vTemp * vTemp);
+            float core = pow(a, 1.7);
+            float sx = exp(-abs(uv.y) * 9.0) * pow(max(0.0, 1.0 - abs(uv.x) * 2.0), 1.5);
+            float sy = exp(-abs(uv.x) * 9.0) * pow(max(0.0, 1.0 - abs(uv.y) * 2.0), 1.5);
+            float spike = (sx + sy) * 0.85;
+            col = tint * (core + spike * 0.7) + vec3(1.0) * pow(core, 3.0) * 0.6;
+            alpha = (core + spike) * vA;
+          }
+          gl_FragColor = vec4(col, alpha);
         }`,
     });
     const points = new THREE.Points(geo, mat);
@@ -795,6 +834,12 @@ export function createHeroScene(
   const nearStars = makeStarLayer({
     count: 700, radius: 620, seed: 4177,
     sizeMin: 0.45, sizeMax: 1.25, alpha: 0.55, twinkle: 0.35,
+  });
+  // bright anchor stars: sparse, spiked, temperature-tinted, on a middle shell
+  // so they drift against both faint fields — the eye catches these first
+  const brightStars = makeStarLayer({
+    count: 190, radius: 1500, seed: 6231,
+    sizeMin: 4.0, sizeMax: 12, alpha: 1, twinkle: 0.55, spikes: true, sizePow: 1.6,
   });
 
   // rare shooting star: one faint tapered streak in the upper sky every ~15-25s.
@@ -1491,6 +1536,7 @@ export function createHeroScene(
     domeUniforms.uTime.value = elapsed;
     farStars.uniforms.uTime.value = elapsed;
     nearStars.uniforms.uTime.value = elapsed;
+    brightStars.uniforms.uTime.value = elapsed;
     groundUniforms.uTime.value = elapsed;
 
     // rare shooting star
@@ -1551,6 +1597,21 @@ export function createHeroScene(
       .set(m[4], m[5], m[6])
       .transformDirection(modelInv);
     simUniforms.uAspect.value = camera.aspect;
+
+    // hover sound strength: pointer speed × the force envelope × proximity to
+    // the mark, gated by the same falloff as the shader's interaction mask
+    if (opts.onHover) {
+      const c = new THREE.Vector3(points.position.x, points.position.y, points.position.z).project(camera);
+      const edge = new THREE.Vector3(points.position.x + points.scale.x * 0.62, points.position.y, points.position.z).project(camera);
+      const radius = Math.abs((edge.x - c.x) * 0.5 * camera.aspect);
+      const dx = (mouseUV.x - (c.x + 1) / 2) * camera.aspect;
+      const dy = mouseUV.y - (c.y + 1) / 2;
+      const d = Math.hypot(dx, dy);
+      const t = Math.min(1, Math.max(0, (d - radius - 0.025) / 0.035));
+      const proximity = 1 - t * t * (3 - 2 * t);
+      const speed = Math.min(1, mouseVel.length() * 10);
+      opts.onHover(speed * interactRef.value * proximity);
+    }
     simUniforms.time.value = elapsed;
     simUniforms.delta.value = delta;
     emberUniforms.time.value = elapsed;
@@ -1701,10 +1762,7 @@ export function createHeroScene(
     }
     dp.needsUpdate = true;
 
-    if (!present) {
-      raf = requestAnimationFrame(() => tick());
-      return;
-    }
+    if (!present) return;
 
     if (revealT > 0.0001) {
       renderer.setRenderTarget(rtFinale);
@@ -1737,7 +1795,6 @@ export function createHeroScene(
     // static frame: advance the sim without presenting, then render once —
     // rendering every step blocks the main thread for seconds on slow GPUs
     for (let i = 0; i < 30; i++) tick(false);
-    cancelAnimationFrame(raf);
     renderer.setRenderTarget(null);
     camera.updateMatrixWorld();
     renderer.render(scene, camera);
@@ -1800,6 +1857,8 @@ export function createHeroScene(
       (farStars.points.material as THREE.Material).dispose();
       nearStars.points.geometry.dispose();
       (nearStars.points.material as THREE.Material).dispose();
+      brightStars.points.geometry.dispose();
+      (brightStars.points.material as THREE.Material).dispose();
       shoot.geometry.dispose();
       shootMat.dispose();
       planet.geometry.dispose();

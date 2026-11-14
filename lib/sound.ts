@@ -12,6 +12,7 @@ const BED_LEVEL = 0.16;
 // the About section below the journey is always silent
 const BEAT_CUTOFF = 0.985;
 const FADE_START = 0.96;
+const HOVER_LEVEL = 0.12;
 
 export type SoundSnapshot = { enabled: boolean; audible: boolean };
 const SERVER_SNAPSHOT: SoundSnapshot = { enabled: true, audible: false };
@@ -26,6 +27,10 @@ class OperaSound {
   private master: GainNode | null = null;
   private bedGate: GainNode | null = null;
   private noiseBuf: AudioBuffer | null = null;
+  private hoverGain: GainNode | null = null;
+  private hoverFilter: BiquadFilterNode | null = null;
+  private hoverQuant = 0;
+  private hoverWasActive = false;
   private enabled = true;
   private unlocked = false;
   private journey = 1; // silent until the hero reports its progress
@@ -126,6 +131,24 @@ class OperaSound {
     airGain.connect(trim);
     air.start();
 
+    // hover shimmer: grain noise swept up in pitch as the pointer stirs the
+    // particles — a persistent voice at zero gain, raised only by setHover
+    const hoverSrc = ctx.createBufferSource();
+    hoverSrc.buffer = this.noiseBuffer(ctx);
+    hoverSrc.loop = true;
+    const hoverFilter = ctx.createBiquadFilter();
+    hoverFilter.type = "bandpass";
+    hoverFilter.frequency.value = 1400;
+    hoverFilter.Q.value = 1.1;
+    const hoverGain = ctx.createGain();
+    hoverGain.gain.value = 0;
+    hoverSrc.connect(hoverFilter);
+    hoverFilter.connect(hoverGain);
+    hoverGain.connect(master);
+    hoverSrc.start();
+    this.hoverFilter = hoverFilter;
+    this.hoverGain = hoverGain;
+
     ctx.addEventListener("statechange", () => this.notify());
     this.applyJourney();
     return ctx;
@@ -188,6 +211,7 @@ class OperaSound {
 
   setReduced(reduced: boolean) {
     this.reduced = reduced;
+    if (reduced) this.setHover(0);
   }
 
   private applyJourney() {
@@ -250,6 +274,52 @@ class OperaSound {
     airGain.connect(master);
     air.start(t, Math.random() * 0.5);
     air.stop(t + 0.5);
+  }
+
+  /** pointer energy over the particle mark, 0..1 — fired every scene frame */
+  setHover(strength: number) {
+    const ctx = this.ctx;
+    const gain = this.hoverGain;
+    const filter = this.hoverFilter;
+    if (
+      !ctx ||
+      !gain ||
+      !filter ||
+      ctx.state !== "running" ||
+      !this.enabled ||
+      this.reduced ||
+      document.hidden ||
+      this.journey >= BEAT_CUTOFF
+    ) {
+      if (this.hoverQuant !== 0) {
+        this.hoverQuant = 0;
+        this.hoverWasActive = false;
+        if (ctx && gain) gain.gain.setTargetAtTime(0, ctx.currentTime, 0.15);
+      }
+      return;
+    }
+    const q = Math.round(Math.min(1, Math.max(0, strength)) * 100) / 100;
+    if (q === this.hoverQuant) return;
+    this.hoverQuant = q;
+    const t = ctx.currentTime;
+    gain.gain.setTargetAtTime(q * HOVER_LEVEL, t, q > 0 ? 0.08 : 0.15);
+    filter.frequency.setTargetAtTime(1400 + q * 2600, t, 0.08);
+    // a tiny glass tick on entering the field — the visual dent's first contact
+    if (q > 0 && !this.hoverWasActive && this.master) {
+      const osc = ctx.createOscillator();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(1900, t);
+      osc.frequency.exponentialRampToValueAtTime(1200, t + 0.06);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.05, t + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+      osc.connect(g);
+      g.connect(this.master);
+      osc.start(t);
+      osc.stop(t + 0.1);
+    }
+    this.hoverWasActive = q > 0;
   }
 
   private computeAudible(): boolean {
